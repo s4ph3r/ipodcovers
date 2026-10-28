@@ -1,0 +1,374 @@
+#!/usr/bin/env python3
+"""
+ipodcovers — конвертирует все изображения в директории в формат
+JPEG Baseline с разрешением до 600px на большую сторону.
+Имена новых файлов: cover.jpg (первый), cover1.jpg, cover2.jpg и т.д.,
+оригиналы переименовываются в *.bak.
+"""
+
+import sys
+import os
+import shutil
+import subprocess
+import argparse
+from pathlib import Path
+
+# ─── Цвета ───────────────────────────────────────────────────────────────
+class C:
+    GREEN   = "\033[92m"
+    DYELLOW = "\033[33m"        # тёмно-жёлтый
+    RED     = "\033[91m"
+    BOLD    = "\033[1m"
+    RESET   = "\033[0m"
+
+# ─── Зависимости ─────────────────────────────────────────────────────────
+REQUIRED_PACKAGES = {
+    "PIL": "pillow",
+}
+
+def check_dependencies():
+    """Проверяем наличие всех требуемых пакетов."""
+    missing = []
+    for import_name, pip_name in REQUIRED_PACKAGES.items():
+        try:
+            __import__(import_name)
+        except ImportError:
+            missing.append(pip_name)
+    return missing
+
+def install_dependencies(packages):
+    """Просим пользователя и устанавливаем через pip."""
+    names = ", ".join(packages)
+    print(f"{C.BOLD}Не установлены необходимые пакеты: {names}{C.RESET}")
+    ans = input(f"{C.BOLD}Установить их сейчас? [Y/n]: {C.RESET}").strip().lower()
+    if ans in ("", "y", "yes", "д", "да"):
+        print(f"Установка {names} ...")
+        try:
+            subprocess.check_call(
+                [sys.executable, "-m", "pip", "install", "--quiet"] + packages
+            )
+            return []
+        except subprocess.CalledProcessError as exc:
+            print(f"{C.RED}Ошибка установки: {exc}{C.RESET}")
+            return packages
+    else:
+        print("Выход.")
+        sys.exit(0)
+
+# ─── JPEG Baseline detection ─────────────────────────────────────────────
+def is_jpeg_baseline(image):
+    """Возвращает True, если изображение уже сохранено как JPEG Baseline."""
+    if image.format != "JPEG":
+        return False
+    try:
+        return image.info.get("progressive") is False or image.info.get("method", 0) == 0
+    except Exception:
+        return True
+
+# ─── Основная логика ─────────────────────────────────────────────────────
+IMAGE_EXTENSIONS = {
+    ".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff",
+    ".gif", ".webp", ".ico", ".pcx", ".pgm", ".ppm",
+    ".pnm", ".sgi", ".tga",
+}
+
+def make_cover_name(directory):
+    """Возвращает свободное имя cover файла в директории.
+    
+    Проверяет: cover.jpg, cover1.jpg, cover2.jpg ...
+    Берёт первый свободный (регистр не важен).
+    """
+    # Получаем все файлы в директории в нижнем регистре
+    existing = [f.lower() for f in os.listdir(str(directory))]
+    
+    # Сначала пробуем cover.jpg (без номера)
+    base = "cover.jpg"
+    if base not in existing:
+        return directory / base
+    
+    # Ищем максимальный номер среди существующих cover*.jpg
+    max_idx = 0
+    for fname in existing:
+        if fname.startswith("cover") and fname.endswith(".jpg"):
+            rest = fname[5:-4]
+            if rest.isdigit():
+                idx = int(rest)
+                if idx > max_idx:
+                    max_idx = idx
+    
+    # Возвращаем следующий свободный
+    return directory / f"cover{max_idx + 1}.jpg"
+
+def is_cover_name(fname):
+    """Проверяет, является ли имя файла cover*.jpg (регистр не важен)."""
+    low = fname.lower()
+    if low == "cover.jpg":
+        return True
+    if low.startswith("cover") and low.endswith(".jpg"):
+        rest = low[5:-4]  # убираем "cover" и ".jpg"
+        if rest.isdigit():
+            return True
+    return False
+
+def format_size(w, h):
+    """Форматирует размер в строку WxH."""
+    return f"{w}x{h}"
+
+def is_yes(ans):
+    """Проверяет, является ли ответ пользователя 'да'/'y'."""
+    return ans.strip().lower() in ("", "y", "yes", "д", "да")
+
+def process_image(fpath, cover_path, bak_path, dry_run):
+    """Обрабатывает одно изображение. Возвращает (status, actions_list).
+    status: 'ok' — полностью соответствует условиям,
+            'changed' — потребовалась обработка,
+            'skip' — не изображение.
+    """
+    try:
+        from PIL import Image
+    except ImportError:
+        print(f"  {C.RED}Ошибка: PIL (pillow) не установлен.{C.RESET}")
+        return ("skip", [])
+
+    try:
+        img = Image.open(str(fpath))
+    except Exception as exc:
+        print(f"  {C.RED}Ошибка открытия {fpath}: {exc}{C.RESET}")
+        return ("skip", [])
+
+    # Если PIL не смог распознать формат — не изображение
+    if img.format is None:
+        print(f"  Файл пропущен (не изображение): {fpath}")
+        img.close()
+        return ("skip", [])
+
+    width, height = img.size
+
+    # ── Уже JPEG Baseline и все стороны ≤ 600 — полностью OK ──
+    if is_jpeg_baseline(img) and width <= 600 and height <= 600:
+        # Если имя уже cover*.jpg — ничего не делать
+        if is_cover_name(fpath.name):
+            print(f"  {C.GREEN}Файл пропущен (уже cover*.jpg, полностью соответствует условиям): {fpath}{C.RESET}")
+            img.close()
+            return ("ok", [])
+        print(f"  {C.GREEN}Файл пропущен (полностью соответствует условиям): {fpath}{C.RESET}")
+        if not dry_run:
+            # Не копируем если cover_path == fpath (тот же файл)
+            if str(cover_path) != str(fpath):
+                shutil.copy2(str(fpath), str(cover_path))
+                try:
+                    st = os.stat(str(fpath))
+                    os.chmod(str(cover_path), st.st_mode)
+                except OSError:
+                    pass
+            if not bak_path.exists():
+                shutil.copy2(str(fpath), str(bak_path))
+                try:
+                    st = os.stat(str(fpath))
+                    os.chmod(str(bak_path), st.st_mode)
+                except OSError:
+                    pass
+            # Удаляем оригинал только если это не тот же файл что cover_path
+            if str(cover_path) != str(fpath):
+                os.remove(str(fpath))
+        img.close()
+        return ("ok", [])
+
+    # ── Нужно конвертировать / ресайзить ──
+    actions = []
+
+    if width > 600 or height > 600:
+        ratio = 600.0 / max(width, height)
+        new_w = int(round(width * ratio))
+        new_h = int(round(height * ratio))
+        img = img.resize((new_w, new_h), Image.LANCZOS)
+        actions.append(f"размер изменён: {format_size(width, height)} -> {format_size(new_w, new_h)}")
+
+    # Переводим в RGB (на случай RGBA/P/...)
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+
+    # Сохраняем как JPEG Baseline
+    save_kwargs = {
+        "format": "JPEG",
+        "quality": 95,
+        "progressive": False,
+    }
+
+    # Проверяем был ли формат не-JPEG или progressive
+    try:
+        img2 = Image.open(str(fpath))
+        orig_format = img2.format
+        is_prog = img2.info.get("progressive", False)
+        if orig_format != "JPEG":
+            actions.append(f"конвертирован из {orig_format.lower()} в JPEG Baseline")
+        elif is_prog:
+            actions.append("конвертирован из JPEG Progressive в JPEG Baseline")
+        img2.close()
+    except Exception:
+        pass
+
+    if not dry_run:
+        if not bak_path.exists():
+            shutil.copy2(str(fpath), str(bak_path))
+            try:
+                st = os.stat(str(fpath))
+                os.chmod(str(bak_path), st.st_mode)
+            except OSError:
+                pass
+
+        img.save(str(cover_path), **save_kwargs)
+        try:
+            st = os.stat(str(fpath))
+            os.chmod(str(cover_path), st.st_mode)
+        except OSError:
+            pass
+
+        # Удаляем оригинал только если это не тот же файл что cover_path
+        if str(cover_path) != str(fpath):
+            os.remove(str(fpath))
+
+    # Формируем строку действий
+    if actions:
+        actions_str = ", ".join(actions)
+        print(f"  {C.DYELLOW}Файл обработан ({actions_str}): {fpath}{C.RESET}")
+    else:
+        print(f"  {C.DYELLOW}Файл обработан: {fpath}{C.RESET}")
+
+    img.close()
+    return ("changed", actions)
+
+
+def main():
+    # ── Ручная обработка аргументов для кастомного help ──
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
+        print(f"""{C.BOLD}ipodcovers — конвертирует изображения в JPEG Baseline (600px макс.){C.RESET}
+
+{C.BOLD}Использование:{C.RESET}
+    {C.BOLD}{sys.argv[0] if len(sys.argv) > 0 else 'ipodcovers'} <путь_к_директории> [опции]{C.RESET}
+
+{C.BOLD}Примеры:{C.RESET}
+    {C.BOLD}{sys.argv[0] if len(sys.argv) > 0 else 'ipodcovers'} /home/user/photos{C.RESET}
+    {C.BOLD}{sys.argv[0] if len(sys.argv) > 0 else 'ipodcovers'} ~/images --dry-run{C.RESET}
+
+{C.BOLD}Опции:{C.RESET}
+    -n, --dry-run     показать что будет сделано, не изменяя файлы
+    -h, --help        вывести эту справку
+
+{C.BOLD}Как работает:{C.RESET}
+    • Все изображения в директории (и поддиректориях) обрабатываются.
+    • Если в папке одно изображение — создаётся cover.jpg.
+    • Если изображений несколько — первое: cover.jpg, остальные:
+      cover1.jpg, cover2.jpg и т.д.
+    • Оригиналы переименовываются с расширением .bak.
+    • JPEG Baseline ≤ 600px на все стороны — только копируется как cover.
+    • Остальные — ресайз (макс. сторона 600) + конвертация в JPEG Baseline.""")
+        sys.exit(0)
+
+    parser = argparse.ArgumentParser(
+        description="ipodcovers — конвертирует изображения в JPEG Baseline 600px.",
+        add_help=False,
+    )
+    parser.add_argument("directory", help="Путь к директории для обработки")
+    parser.add_argument("-n", "--dry-run", action="store_true",
+                        help="Показать что будет сделано, не изменяя файлы")
+    parser.add_argument("-h", "--help", action="store_true",
+                        help="Вывести справку")
+
+    try:
+        args = parser.parse_args()
+    except SystemExit:
+        sys.exit(1)
+
+    target = Path(args.directory)
+    if not target.is_dir():
+        print(f"{C.RED}Ошибка: '{target}' — не существует или это не директория.{C.RESET}")
+        sys.exit(1)
+
+    # ── Проверка зависимостей ──
+    missing = check_dependencies()
+    if missing:
+        remaining = install_dependencies(missing)
+        if remaining:
+            print(f"{C.RED}Не удалось установить: {', '.join(remaining)}. Выход.{C.RESET}")
+            sys.exit(1)
+
+    # ── Сканирование ──
+    print(f"\n{C.BOLD}ipodcovers — сканирование: {target}{C.RESET}\n")
+
+    total = 0
+    processed_ok = 0       # полностью соответствуют условиям
+    processed_change = 0   # потребовалась обработка
+
+    # Счётчики изображений по каждой директории (для нумерации cover)
+    dir_counters = {}
+
+    # Сначала собираем все файлы для обработки (чтобы os.walk не видел созданные нами cover*.jpg)
+    files_to_process = []
+    for root, dirs, files in os.walk(str(target)):
+        for fname in sorted(files):
+            fpath = Path(root) / fname
+            if fname.endswith(".bak"):
+                continue
+            if fpath.suffix.lower() not in IMAGE_EXTENSIONS:
+                continue
+            files_to_process.append((root, fname))
+
+    # Затем обрабатываем собранный список
+    for root, fname in files_to_process:
+        fpath = Path(root) / fname
+        total += 1
+        print(f"\nОбработка: {fpath}")
+
+        dir_path = str(root)
+        if dir_path not in dir_counters:
+            dir_counters[dir_path] = 0
+
+        # Если текущий файл уже имеет имя cover*.jpg — используем его же путь для результата
+        if is_cover_name(fname):
+            cover_path = fpath
+        else:
+            cover_path = make_cover_name(Path(root))
+        bak_path = fpath.with_suffix(fpath.suffix + ".bak")
+
+        status, actions = process_image(fpath, cover_path, bak_path, args.dry_run)
+
+        if status == "ok":
+            processed_ok += 1
+        elif status == "changed":
+            processed_change += 1
+
+    print(f"\n{C.BOLD}Готово. Обработано файлов: {processed_ok + processed_change}/{total} "
+          f"(полностью OK: {processed_ok}, потребовалась обработка: {processed_change}){C.RESET}\n")
+
+    # ── Вопрос об удалении .bak файлов ──
+    if not args.dry_run and (processed_ok + processed_change) > 0:
+        bak_files = []
+        for root, dirs, files in os.walk(str(target)):
+            for fname in files:
+                if fname.endswith(".bak"):
+                    bak_files.append(os.path.join(root, fname))
+
+        if bak_files:
+            print(f"\n{C.BOLD}Найдено {len(bak_files)} файлов .bak (оригиналы изображений).{C.RESET}")
+            ans = input(f"{C.BOLD}Удалить все .bak файлы? [Y/n]: {C.RESET}").strip().lower()
+            if is_yes(ans):
+                removed = 0
+                for bpath in bak_files:
+                    try:
+                        os.remove(bpath)
+                        removed += 1
+                        print(f"  {C.GREEN}Удалён: {bpath}{C.RESET}")
+                    except OSError as exc:
+                        print(f"  {C.RED}Ошибка удаления {bpath}: {exc}{C.RESET}")
+                print(f"\n{C.BOLD}Удалено .bak файлов: {removed}/{len(bak_files)}{C.RESET}\n")
+            else:
+                print(f"{C.DYELLOW}Файлы .bak сохранены.{C.RESET}\n")
+        else:
+            print()
+
+    print("Готово.")
+
+
+if __name__ == "__main__":
+    main()
